@@ -73,7 +73,7 @@ async def parse_resume(file: UploadFile = File(...)):
             messages=[
                 {
                     "role": "system", 
-                    "content": f"You are a resume parser. Extract data into this exact JSON structure: {ResumeSchema.model_json_schema()}. Do not return any thinking or conversational text, only valid JSON. Do not use ANY data not present in the original text."
+                    "content": f"You are a resume parser. Extract data into this exact JSON structure: {ResumeSchema().model_dump_json()}. Do not return any thinking or conversational text, only valid JSON. Do not use ANY data not present in the original text."
                 },
                 {
                     "role": "user", 
