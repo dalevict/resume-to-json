@@ -20,7 +20,7 @@ assert os.getenv("OPEN_KEY") is not None
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPEN_KEY"),
-    timeout=60.0,  # explicit timeout so hung requests fail fast
+    timeout=60.0,
 )
 
 
@@ -43,7 +43,7 @@ class EducationExperience(BaseModel):
     minor: str = None
     startdatetime: datetime = None
     enddatetime: datetime = None
-    
+
 class Certification(BaseModel):
     institution: str = None
     name: str = None
@@ -79,7 +79,24 @@ def _call_llm(messages: list) -> str:
         max_tokens=4096,
         messages=messages,
     )
-    return response.choices[0].message.content
+    choice = response.choices[0]
+    finish_reason = choice.finish_reason
+    content = choice.message.content or ""
+
+    print(f"[LLM] finish_reason={finish_reason!r}  len={len(content)}  preview={content[:120]!r}")
+
+    if finish_reason == "length":
+        # Model hit the token limit — response is truncated JSON, not parseable.
+        # Raise so the retry loop can react with a corrective message.
+        raise ValueError(
+            f"Response truncated (finish_reason='length'). "
+            f"Got {len(content)} chars. Consider a model with a larger output limit."
+        )
+
+    if not content.strip():
+        raise ValueError("Model returned an empty response.")
+
+    return content
 
 
 @app.post("/pdf")
@@ -112,19 +129,35 @@ async def parse_resume(file: UploadFile = File(...)):
 
         last_error = None
         for attempt in range(3):
-            # Offload blocking OpenAI call to a thread
-            json_string = await loop.run_in_executor(
-                None, partial(_call_llm, messages)
-            )
+            try:
+                # Offload blocking OpenAI call to a thread
+                json_string = await loop.run_in_executor(
+                    None, partial(_call_llm, messages)
+                )
+            except ValueError as e:
+                # finish_reason='length' or empty response — log and retry
+                last_error = e
+                print(f"[attempt {attempt+1}] LLM call failed: {e}")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was unusable. "
+                        "Return ONLY a compact valid JSON object matching the schema. "
+                        "Omit all descriptions and details fields to reduce output size if needed."
+                    ),
+                })
+                continue
+
             try:
                 parsed_json = json.loads(json_string)
                 resume = ResumeSchema(**parsed_json)
-                print(remaining_text(json_string, "pdf.txt")) # TODO: fix, only matches exact strings, too rigid
+                print(remaining_text(json_string, "pdf.txt"))
                 with open("pdf.json", "w", encoding="utf-8") as f:
                     json.dump(parsed_json, f, indent=4)
                 return resume
             except Exception as e:
                 last_error = e
+                print(f"[attempt {attempt+1}] JSON parse/validation failed: {e}")
                 messages.append({"role": "assistant", "content": json_string})
                 messages.append(
                     {
@@ -146,9 +179,31 @@ async def parse_resume(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def remaining_text(json_string: str = None, txt_path: str = None):
+def remaining_text(json_string: str = None, txt_path: str = None, coverage_threshold: float = 0.5) -> str:
+    """
+    Returns lines from the raw PDF text that are not SUBSTANTIALLY covered
+    by the extracted JSON values.
+
+    Strategy: token-level coverage.
+      1. Collect all string leaf values from the JSON and tokenize them into
+         a set of lowercase alphanumeric tokens (the "known" vocabulary).
+      2. For every non-empty line in the raw PDF text, compute what fraction
+         of its tokens appear in the known set.
+      3. Lines whose coverage is below `coverage_threshold` are considered
+         "not captured" and returned.
+
+    This avoids the original substring-replace approach, which caused two bugs:
+      - Partial matches: removing "Python" also stripped it from longer phrases.
+      - LLM paraphrasing: the model rewrites bullet points, so the exact PDF
+        text never matches and the whole section survives unreplaced.
+    """
+    import re
+
     with open(txt_path, "r", encoding="utf-8") as f:
         raw_text = f.read()
+
+    def tokenize(text: str) -> list:
+        return re.findall(r"[a-z0-9]+", text.lower())
 
     def extract_values(obj) -> list:
         values = []
@@ -165,13 +220,25 @@ def remaining_text(json_string: str = None, txt_path: str = None):
     parsed = json.loads(json_string)
     json_values = extract_values(parsed)
 
-    remaining = raw_text
-    for value in json_values:
-        remaining = remaining.replace(value, "")
+    # Build a flat set of all tokens present anywhere in the JSON
+    known_tokens = set()
+    for val in json_values:
+        known_tokens.update(tokenize(val))
 
-    lines = [line.strip() for line in remaining.splitlines()]
-    result_string = "\n".join(line for line in lines if line)
-    return result_string
+    uncovered_lines = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line_tokens = tokenize(line)
+        if not line_tokens:
+            continue
+        covered = sum(1 for t in line_tokens if t in known_tokens)
+        coverage = covered / len(line_tokens)
+        if coverage < coverage_threshold:
+            uncovered_lines.append(line)
+
+    return "\n".join(uncovered_lines)
 
 
 if __name__ == "__main__":
