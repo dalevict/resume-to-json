@@ -2,3 +2,6 @@
 *.swp
 *.txt
 *.json
+llama-*
+.venv
+*mistral*

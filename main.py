@@ -7,15 +7,16 @@ from functools import partial
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from openai import OpenAI
 from dotenv import load_dotenv
+import httpx
 
 
 app = FastAPI()
 load_dotenv("OPEN_KEY.env")
 
-assert os.getenv("OPEN_KEY") is not None
+# assert os.getenv("OPEN_KEY") is not None
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -27,13 +28,13 @@ client = OpenAI(
 class JobExperience(BaseModel):
     company: str = None
     role: str = None
-    startdatetime: datetime = None
-    enddatetime: datetime = None
+    startdatetime: str = None
+    enddatetime: str = None
     description: str = None
 
 class ProjectExperience(BaseModel):
-    startdatetime: datetime = None
-    enddatetime: datetime = None
+    startdatetime: str = None
+    enddatetime: str = None
     description: str = None
 
 class EducationExperience(BaseModel):
@@ -41,19 +42,19 @@ class EducationExperience(BaseModel):
     degree: str = None
     major: str = None
     minor: str = None
-    startdatetime: datetime = None
-    enddatetime: datetime = None
+    startdatetime: str = None
+    enddatetime: str = None
 
 class Certification(BaseModel):
     institution: str = None
     name: str = None
-    completeddatetime: datetime = None
-    expirationdatetime: datetime = None
+    completeddatetime: str = None
+    expirationdatetime: str = None
 
 class ResumeSchema(BaseModel):
-    full_name: str = None
-    email: str = None
-    phone: str = None
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
     skills: List[str] = []
     experience: List[JobExperience] = []
     education: List[EducationExperience] = []
@@ -71,86 +72,76 @@ def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     return raw_text
 
 
-def _call_llm(messages: list) -> str:
-    """Pure sync function — safe to run in a thread executor."""
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-20b:free",
-        response_format={"type": "json_object"},
-        max_tokens=4096,
-        messages=messages,
+def _build_prompt(raw_text: str) -> str:
+    return (
+        "### Instruction: You are a resume data expert. "
+        "Extract the following resume text into a JSON object with these fields: "
+        "full_name (string), email (string), phone (string), "
+        "skills (array of strings), "
+        "experience (array of objects with: company, role, startdatetime, enddatetime, description), "
+        "education (array of objects with: institution, degree, major, minor, startdatetime, enddatetime), "
+        "certifications (array of objects with: institution, name, completeddatetime, expirationdatetime). "
+        "Use only data present in the resume. Set fields to null if not found.\n\n"
+        f"### Input:\n{raw_text}\n\n"
+        "### Output:"
     )
-    choice = response.choices[0]
-    finish_reason = choice.finish_reason
-    content = choice.message.content or ""
 
-    print(f"[LLM] finish_reason={finish_reason!r}  len={len(content)}  preview={content[:120]!r}")
 
-    if finish_reason == "length":
-        # Model hit the token limit — response is truncated JSON, not parseable.
-        # Raise so the retry loop can react with a corrective message.
-        raise ValueError(
-            f"Response truncated (finish_reason='length'). "
-            f"Got {len(content)} chars. Consider a model with a larger output limit."
-        )
+def _call_local(raw_text: str) -> str:
+    prompt = _build_prompt(raw_text)
+    resp = httpx.post(
+        "http://localhost:8080/completion",
+        json={
+            "prompt": prompt,
+            "max_tokens": 4096,
+            "temperature": 0.1,
+            "stop": ["### Instruction", "### Input"],
+        },
+        timeout=300.0,  # 5 mins generous
+    )
+    resp.raise_for_status()
+    content = resp.json().get("content", "").strip()
+    print("Unfiltered model response: ")
+    print(content)
+    print("="*69)
+    brace = content.find('{') # remove pre JSON
+    if brace > 0:
+        content = content[brace:]
 
-    if not content.strip():
+    print(f"[LLM] len={len(content)}  preview={content[:120]!r}")
+    if not content:
         raise ValueError("Model returned an empty response.")
-
     return content
 
 
 @app.post("/pdf")
 async def parse_resume(file: UploadFile = File(...)):
+    print("New request: " + file.filename)
     try:
-        # Read all bytes up front (async-safe)
         pdf_bytes = await file.read()
-
-        # Offload blocking PDF parsing to a thread so the event loop stays free
         loop = asyncio.get_event_loop()
         raw_text = await loop.run_in_executor(
             None, _extract_text_from_pdf_bytes, pdf_bytes
         )
-
+        print(f"[PDF] extracted {len(raw_text)} chars, preview: {raw_text[:200]!r}")
         with open("pdf.txt", "w", encoding="utf-8") as f:
             f.write(raw_text)
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"You are a resume parser. Extract data into this exact JSON structure: "
-                    f"{ResumeSchema().model_dump_json()}. "
-                    "Do not return any thinking or conversational text, only valid JSON. "
-                    "Do not use ANY data not present in the original text."
-                ),
-            },
-            {"role": "user", "content": raw_text},
-        ]
 
         last_error = None
         for attempt in range(3):
             try:
-                # Offload blocking OpenAI call to a thread
                 json_string = await loop.run_in_executor(
-                    None, partial(_call_llm, messages)
+                    None, partial(_call_local, raw_text)
                 )
             except ValueError as e:
-                # finish_reason='length' or empty response — log and retry
                 last_error = e
                 print(f"[attempt {attempt+1}] LLM call failed: {e}")
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Your previous response was unusable. "
-                        "Return ONLY a compact valid JSON object matching the schema. "
-                        "Omit all descriptions and details fields to reduce output size if needed."
-                    ),
-                })
                 continue
-
             try:
                 parsed_json = json.loads(json_string)
                 resume = ResumeSchema(**parsed_json)
+                if not resume.full_name and not resume.email and not resume.skills and not resume.experience:
+                    raise ValueError("Model returned empty schema with no extracted data.")
                 print(remaining_text(json_string, "pdf.txt"))
                 with open("pdf.json", "w", encoding="utf-8") as f:
                     json.dump(parsed_json, f, indent=4)
@@ -158,21 +149,10 @@ async def parse_resume(file: UploadFile = File(...)):
             except Exception as e:
                 last_error = e
                 print(f"[attempt {attempt+1}] JSON parse/validation failed: {e}")
-                messages.append({"role": "assistant", "content": json_string})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"That response was invalid: {e}. "
-                            "Return only valid JSON matching the schema, nothing else."
-                        ),
-                    }
-                )
 
         raise HTTPException(
             status_code=500, detail=f"Failed after 3 attempts: {last_error}"
         )
-
     except HTTPException:
         raise
     except Exception as e:
@@ -180,23 +160,6 @@ async def parse_resume(file: UploadFile = File(...)):
 
 
 def remaining_text(json_string: str = None, txt_path: str = None, coverage_threshold: float = 0.5) -> str:
-    """
-    Returns lines from the raw PDF text that are not SUBSTANTIALLY covered
-    by the extracted JSON values.
-
-    Strategy: token-level coverage.
-      1. Collect all string leaf values from the JSON and tokenize them into
-         a set of lowercase alphanumeric tokens (the "known" vocabulary).
-      2. For every non-empty line in the raw PDF text, compute what fraction
-         of its tokens appear in the known set.
-      3. Lines whose coverage is below `coverage_threshold` are considered
-         "not captured" and returned.
-
-    This avoids the original substring-replace approach, which caused two bugs:
-      - Partial matches: removing "Python" also stripped it from longer phrases.
-      - LLM paraphrasing: the model rewrites bullet points, so the exact PDF
-        text never matches and the whole section survives unreplaced.
-    """
     import re
 
     with open(txt_path, "r", encoding="utf-8") as f:
@@ -220,7 +183,6 @@ def remaining_text(json_string: str = None, txt_path: str = None, coverage_thres
     parsed = json.loads(json_string)
     json_values = extract_values(parsed)
 
-    # Build a flat set of all tokens present anywhere in the JSON
     known_tokens = set()
     for val in json_values:
         known_tokens.update(tokenize(val))
@@ -243,4 +205,4 @@ def remaining_text(json_string: str = None, txt_path: str = None, coverage_thres
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=600)
