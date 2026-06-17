@@ -2,7 +2,7 @@ import os
 import io
 import json
 import asyncio
-from datetime import datetime
+
 from functools import partial
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -28,13 +28,13 @@ client = OpenAI(
 class JobExperience(BaseModel):
     company: str = None
     role: str = None
-    startdatetime: str = None
-    enddatetime: str = None
+    startdatetime: Optional[str] = None
+    enddatetime: Optional[str] = None
     description: str = None
 
 class ProjectExperience(BaseModel):
-    startdatetime: str = None
-    enddatetime: str = None
+    startdatetime: Optional[str] = None
+    enddatetime: Optional[str] = None
     description: str = None
 
 class EducationExperience(BaseModel):
@@ -42,14 +42,14 @@ class EducationExperience(BaseModel):
     degree: str = None
     major: str = None
     minor: str = None
-    startdatetime: str = None
-    enddatetime: str = None
+    startdatetime: Optional[str] = None
+    enddatetime: Optional[str] = None
 
 class Certification(BaseModel):
     institution: str = None
     name: str = None
-    completeddatetime: str = None
-    expirationdatetime: str = None
+    completeddatetime: Optional[str] = None
+    expirationdatetime: Optional[str] = None
 
 class ResumeSchema(BaseModel):
     full_name: Optional[str] = None
@@ -89,6 +89,8 @@ def _build_prompt(raw_text: str) -> str:
 
 def _call_local(raw_text: str) -> str:
     prompt = _build_prompt(raw_text)
+    # Generous timeout: the model runs at ~6 t/s on CPU and resumes can produce
+    # 400+ tokens, so a single inference pass can take well over a minute.
     resp = httpx.post(
         "http://localhost:8080/completion",
         json={
@@ -97,14 +99,11 @@ def _call_local(raw_text: str) -> str:
             "temperature": 0.1,
             "stop": ["### Instruction", "### Input"],
         },
-        timeout=300.0,  # 5 mins generous
+        timeout=300.0,
     )
     resp.raise_for_status()
     content = resp.json().get("content", "").strip()
-    print("Unfiltered model response: ")
-    print(content)
-    print("="*69)
-    brace = content.find('{') # remove pre JSON
+    brace = content.find('{')
     if brace > 0:
         content = content[brace:]
 
@@ -142,7 +141,8 @@ async def parse_resume(file: UploadFile = File(...)):
                 resume = ResumeSchema(**parsed_json)
                 if not resume.full_name and not resume.email and not resume.skills and not resume.experience:
                     raise ValueError("Model returned empty schema with no extracted data.")
-                print(remaining_text(json_string, "pdf.txt"))
+                with open("difference.txt", "w", encoding="utf-8") as diff_f:
+                    diff_f.write(remaining_text(json_string, "pdf.txt"))
                 with open("pdf.json", "w", encoding="utf-8") as f:
                     json.dump(parsed_json, f, indent=4)
                 return resume
